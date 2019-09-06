@@ -157,6 +157,12 @@ def main():
 
     parser.add_argument('--experiment', default='logs', help='Where to store models')
 
+    ## DA
+
+    parser.add_argument('--source', type=str, default='real')
+    parser.add_argument('--target', type=str, default='sketch')
+
+
     # default settings
     opt = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,15 +180,19 @@ def main():
         opt.model = opt.source_model
         weights = []
         source_gen_params = []
-        source_path = os.path.join(
-            opt.source_path, '{}-{}'.format(opt.source_domain, opt.source_model),
-            '0',
-            'model_best.pth.tar'
-        )
+
+        source_path = '/home/pjw/projects/what_and_where_to_transfer/source_models/G_iter_model_resnet34_MME_real_to_sketch_step_40000.pth.tar'
+        # source_path = os.path.join(
+        #     opt.source_path, '{}-{}'.format(opt.source_domain, opt.source_model),
+        #     '0',
+        #     'model_best.pth.tar'
+        # )
         ckpt = torch.load(source_path)
-        opt.num_classes = ckpt['num_classes']
-        source_model = check_model(opt).to(device)
-        source_model.load_state_dict(ckpt['state_dict'], strict=False)
+        #print(ckpt.keys())
+        opt.num_classes = 345  #ckpt['num_classes']
+        from models import resnet_ilsvrc
+        source_model = resnet_ilsvrc.__dict__[opt.source_model](pretrained=True).to(device) # check_model(opt).to(device)
+        source_model.load_state_dict(ckpt, strict=False)
 
     pairs = []
     for pair in opt.pairs.split(','):
@@ -294,7 +304,7 @@ def main():
         source_model.eval()
         for i, data in enumerate(loaders[0]):
             target_optimizer.zero_grad()
-            inner_objective(data).backward()
+            inner_objective(data).backward() # cre + feature matching loss
             target_optimizer.step(None)
 
             logger.info('[Epoch {:3d}] [Iter {:3d}] [Loss {:.4f}] [Acc {:.4f}] [LW {}]'.format(
@@ -304,14 +314,14 @@ def main():
 
             for _ in range(opt.T):
                 target_optimizer.zero_grad()
-                target_optimizer.step(inner_objective, data, True)
+                target_optimizer.step(inner_objective, data, True)  # feature matching loss만 학습
 
             target_optimizer.zero_grad()
-            target_optimizer.step(outer_objective, data)
+            target_optimizer.step(outer_objective, data) # update theta, minimize cre
 
             target_optimizer.zero_grad()
             source_optimizer.zero_grad()
-            outer_objective(data).backward()
+            outer_objective(data).backward() # update w,lamda, minimize cre
             target_optimizer.meta_backward()
             source_optimizer.step()
 

@@ -4,6 +4,8 @@ import torchvision.transforms as transforms
 import torchvision.datasets as dset
 import torch.utils.data as data
 
+from utils.return_dataset import return_dataset
+
 
 class FolderSubset(data.Dataset):
     def __init__(self, dataset, classes, indices):
@@ -58,6 +60,10 @@ def check_dataset(opt):
         sets = [FolderSubset(dataset, *split) for dataset, split in zip(sets, splits)]
 
         opt.num_classes = len(splits[0][0])
+    elif opt.dataset in ['skt', 'rel']:
+        source_loader, target_loader, target_loader_unl, class_list = return_dataset(opt)
+        opt.num_classes = len(class_list)
+        return [target_loader_unl, target_loader_unl, target_loader]
 
     else:
         raise Exception('Unknown dataset')
