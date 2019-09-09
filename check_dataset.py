@@ -63,7 +63,7 @@ def check_dataset(opt):
     elif opt.dataset in ['skt', 'rel']:
         source_loader, target_loader, target_loader_unl, class_list = return_dataset(opt)
         opt.num_classes = len(class_list)
-        return [target_loader_unl, target_loader_unl, target_loader]
+        return [source_loader, target_loader, target_loader_unl, target_loader_unl]
 
     else:
         raise Exception('Unknown dataset')

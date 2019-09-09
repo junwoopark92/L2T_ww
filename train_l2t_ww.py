@@ -11,6 +11,7 @@ from check_dataset import check_dataset
 from check_model import check_model
 from utils.utils import AverageMeter, accuracy, set_logging_config
 from train.meta_optimizers import MetaSGD
+from models.basenet import Predictor, Predictor_deep
 
 torch.backends.cudnn.benchmark = True
 
@@ -123,6 +124,27 @@ class LossWeightNetwork(nn.ModuleList):
         return outputs
 
 
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        m.weight.data.normal_(0.0, 0.1)
+    elif classname.find('Linear') != -1:
+        nn.init.xavier_normal_(m.weight)
+        nn.init.zeros_(m.bias)
+    elif classname.find('BatchNorm') != -1:
+        m.weight.data.normal_(1.0, 0.1)
+        m.bias.data.fill_(0)
+
+
+def adentropy(F1,feat,lamda,eta=1.0):
+    out_t1 = F1(feat, reverse=True, eta=eta)
+    out_t1 = F.softmax(out_t1)
+    loss_adent = lamda * torch.mean(torch.sum(out_t1 * (torch.log(out_t1 + 1e-5)), 1))
+    return loss_adent
+
+def str2bool(v):
+    return v.lower() in ('true')
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--dataroot', required=True, help='Path to the dataset')
@@ -161,6 +183,8 @@ def main():
 
     parser.add_argument('--source', type=str, default='real')
     parser.add_argument('--target', type=str, default='sketch')
+    parser.add_argument('--method', type=str, default='MME')
+    parser.add_argument('--pretrained', type=str2bool, default=False)
 
 
     # default settings
@@ -221,44 +245,64 @@ def main():
 
     # load target model
     opt.model = opt.target_model
-    target_model = check_model(opt).to(device)
+    # target_model = check_model(opt).to(device)
+    # target G, target F
+    target_G = check_model(opt).to(device)
+    target_F = Predictor(num_class=opt.num_classes, inc=512, temp=1).to(device)
+
+    weights_init(target_F)
+
     target_branch = FeatureMatching(opt.source_model,
                                     opt.target_model,
                                     pairs).to(device)
-    target_params = list(target_model.parameters()) + list(target_branch.parameters())
+
+    target_params = list(target_G.parameters()) + list(target_F.parameters()) + list(target_branch.parameters())
+    target_G_params = list(target_G.parameters())
+    target_F_params = list(target_F.parameters())
+
     if opt.meta_lr == 0:
-        target_optimizer = optim.SGD(target_params, lr=opt.lr, momentum=opt.momentum, weight_decay=opt.wd)
+        target_G_optimizer = optim.SGD(target_params, lr=opt.lr, momentum=opt.momentum, weight_decay=opt.wd)
     else:
         target_optimizer = MetaSGD(target_params,
-                                   [target_model, target_branch],
+                                   [target_G, target_branch],
                                    lr=opt.lr,
                                    momentum=opt.momentum,
                                    weight_decay=opt.wd, rollback=True, cpu=opt.T>2)
 
+        target_G_optimizer = optim.SGD(target_G_params, lr=opt.lr, momentum=opt.momentum, weight_decay=opt.wd)
+        target_F_optimizer = optim.SGD(target_F_params, lr=opt.lr, momentum=opt.momentum, weight_decay=opt.wd)
+
     state = {
-        'target_model': target_model.state_dict(),
+        'target_G': target_G.state_dict(),
+        'target_F': target_F.state_dict(),
         'target_branch': target_branch.state_dict(),
-        'target_optimizer': target_optimizer.state_dict(),
+        'target_optimizer': target_G_optimizer.state_dict(),
         'w': wnet.state_dict(),
-        'best': (0.0, 0.0)
+        'best': (0.0, 0.0, 0.0)
     }
     if opt.loss_weight:
         state['lw'] = lwnet.state_dict()
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(target_optimizer, opt.epochs)
+    G_scheduler = optim.lr_scheduler.CosineAnnealingLR(target_G_optimizer, opt.epochs)
+    F_scheduler = optim.lr_scheduler.CosineAnnealingLR(target_F_optimizer, opt.epochs)
 
-    def validate(model, loader):
+    def validate(G, F, loader):
         acc = AverageMeter()
-        model.eval()
+        G.eval()
+        F.eval()
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            y_pred, _ = model(x)
+            features, _ = G.forward_features(x)
+            y_pred = F(features)
             acc.update(accuracy(y_pred.data, y, topk=(1,))[0].item(), x.size(0))
         return acc.avg
 
     def inner_objective(data, matching_only=False):
         x, y = data[0].to(device), data[1].to(device)
-        y_pred, target_features = target_model.forward_with_features(x)
+        # MME
+        features, target_features = target_G.forward_features(x)
+        y_pred = target_F(features)
 
         with torch.no_grad():
             s_pred, source_features = source_model.forward_with_features(x)
@@ -281,15 +325,23 @@ def main():
         if matching_only:
             return matching_loss
 
+        # cross entropy
         loss = F.cross_entropy(y_pred, y)
         state['loss'] = loss.item()
+
         return loss + matching_loss
 
     def outer_objective(data):
         x, y = data[0].to(device), data[1].to(device)
-        y_pred, _ = target_model(x)
+        ### MME
+        features, _ = target_G.forward_features(x)
+        y_pred = target_F(features)
+
         state['accuracy'] = accuracy(y_pred.data, y, topk=(1,))[0].item()
+
+        # cross entropy
         loss = F.cross_entropy(y_pred, y)
+        #
         state['loss'] = loss.item()
         return loss
 
@@ -298,14 +350,57 @@ def main():
     for epoch in range(opt.epochs):
         if opt.schedule:
             scheduler.step()
+            G_scheduler.step()
+            F_scheduler.step()
 
         state['epoch'] = epoch
-        target_model.train()
+        target_G.train()
+        target_F.train()
         source_model.eval()
-        for i, data in enumerate(loaders[0]):
+
+        source_loader = loaders[0]
+        target_loader = loaders[1]
+        unl_target_loader = loaders[2]
+
+        data_iter_s = iter(source_loader)
+        data_iter_t = iter(target_loader)
+        data_iter_t_unl = iter(target_loader)
+
+        len_train_source = len(source_loader)
+        len_train_target = len(target_loader)
+        len_train_target_semi = len(unl_target_loader)
+
+        steps = 1000
+        for step in range(steps):
+
+            if step % len_train_target == 0:
+                data_iter_t = iter(target_loader)
+            if step % len_train_target_semi == 0:
+                data_iter_t_unl = iter(unl_target_loader)
+            if step % len_train_source == 0:
+                data_iter_s = iter(source_loader)
+
+            data_t = next(data_iter_t)
+            data_t_unl = next(data_iter_t_unl)
+            data_s = next(data_iter_s)
+
+            img_con = torch.cat((data_t[0], data_s[0]), 0)
+            label_con = torch.cat((data_t[1], data_s[1]), 0)
+            data = img_con, label_con
+
             target_optimizer.zero_grad()
             inner_objective(data).backward() # cre + feature matching loss
             target_optimizer.step(None)
+
+            ## MME for F1
+            if not opt.method == 'S+T':
+
+                tu_unl_features, _ = target_G.forward_features(data_t_unl[0].to(device))
+                if opt.method == 'MME':
+                    loss_t = adentropy(target_F, tu_unl_features, 0.1)
+                    loss_t.backward()
+                    target_G_optimizer.step()
+                    target_F_optimizer.step()
 
             logger.info('[Epoch {:3d}] [Iter {:3d}] [Loss {:.4f}] [Acc {:.4f}] [LW {}]'.format(
                 state['epoch'], state['iter'],
@@ -325,16 +420,18 @@ def main():
             target_optimizer.meta_backward()
             source_optimizer.step()
 
-        acc = (validate(target_model, loaders[1]),
-               validate(target_model, loaders[2]))
+        acc = (validate(target_G, target_F, loaders[0]),
+               validate(target_G, target_F, loaders[1]),
+               validate(target_G, target_F, loaders[3]))
 
-        if state['best'][0] < acc[0]:
+        if state['best'][2] < acc[2]:
             state['best'] = acc
 
         if state['epoch'] % 10 == 0:
             torch.save(state, os.path.join(opt.experiment, 'ckpt-{}.pth'.format(state['epoch']+1)))
 
-        logger.info('[Epoch {}] [val {:.4f}] [test {:.4f}] [best {:.4f}]'.format(epoch, acc[0], acc[1], state['best'][1]))
+        logger.info('[Epoch {}] [src_val {:.4f}] [trg_val {:.4f}] [test {:.4f}] [best {:.4f}]'
+                    .format(epoch, acc[0], acc[1], acc[2], state['best'][2]))
 
 
 if __name__ == '__main__':

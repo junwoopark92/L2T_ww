@@ -156,6 +156,96 @@ class ResNet(nn.Module):
     def forward_with_features(self, x):
         return self.forward(x)
 
+    def forward_features(self, x):
+        f1 = self.conv1(x)
+        b1 = self.bn1(f1)
+        r1 = self.relu(b1)
+        p1 = self.maxpool(r1)
+
+        f2 = self.layer1(p1)
+        f3 = self.layer2(f2)
+        f4 = self.layer3(f3)
+        f5 = self.layer4(f4)
+
+        f6 = self.avgpool(f5)
+        f6 = f6.view(f6.size(0), -1)
+        return f6, [r1, f2, f3, f4, f5]
+
+class ResNet_G(nn.Module):
+
+    def __init__(self, block, layers, num_classes=1000, meta=None):
+        self.inplanes = 64
+        super(ResNet_G, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.avgpool = nn.AvgPool2d(7, stride=1)
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.lwf = False
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        f1 = self.conv1(x)
+        b1 = self.bn1(f1)
+        r1 = self.relu(b1)
+        p1 = self.maxpool(r1)
+
+        f2 = self.layer1(p1)
+        f3 = self.layer2(f2)
+        f4 = self.layer3(f3)
+        f5 = self.layer4(f4)
+
+        f6 = self.avgpool(f5)
+        f6 = f6.view(f6.size(0), -1)
+        f7 = self.fc(f6)
+
+        return f7, [r1, f2, f3, f4, f5]
+
+    def forward_features(self, x):
+        f1 = self.conv1(x)
+        b1 = self.bn1(f1)
+        r1 = self.relu(b1)
+        p1 = self.maxpool(r1)
+
+        f2 = self.layer1(p1)
+        f3 = self.layer2(f2)
+        f4 = self.layer3(f3)
+        f5 = self.layer4(f4)
+
+        f6 = self.avgpool(f5)
+        f6 = f6.view(f6.size(0), -1)
+        return f6, [r1, f2, f3, f4, f5]
+
 
 def resnet18(pretrained=False, meta=False, **kwargs):
     """Constructs a ResNet-18 model.
